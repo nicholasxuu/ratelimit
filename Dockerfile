@@ -1,7 +1,8 @@
 FROM golang:1.14 AS build
 WORKDIR /ratelimit
 
-ENV GOPROXY=https://proxy.golang.org
+RUN go env -w GOPROXY=https://goproxy.cn,direct
+
 COPY go.mod go.sum /ratelimit/
 RUN go mod download
 
@@ -13,4 +14,5 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /go/bin/ratelimit -ldflags="-w -s" -v g
 
 FROM alpine:3.11 AS final
 RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add bash
 COPY --from=build /go/bin/ratelimit /bin/ratelimit
