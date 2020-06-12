@@ -60,6 +60,7 @@ func (this *rateLimitCacheImpl) DoLimit(
 	forceFlag bool,
 	ipFilter filter.Filter,
 	uidFilter filter.Filter,
+	onlyLogOnLimit bool,
 ) []*pb.RateLimitResponse_DescriptorStatus {
 
 	logger.Debugf("starting cache lookup")
@@ -149,13 +150,43 @@ func (this *rateLimitCacheImpl) DoLimit(
 			continue
 		}
 
+		if cacheKey.Key == cacheKeyBlocked {
+			if onlyLogOnLimit {
+				logger.Infof("Triggered ratelimit for key: %s", cacheKey.Key)
+				responseDescriptorStatuses[i] =
+					&pb.RateLimitResponse_DescriptorStatus{
+						Code:           pb.RateLimitResponse_OK,
+						CurrentLimit:   nil,
+						LimitRemaining: 0,
+					}
+			} else {
+				responseDescriptorStatuses[i] =
+					&pb.RateLimitResponse_DescriptorStatus{
+						Code:           pb.RateLimitResponse_OVER_LIMIT,
+						CurrentLimit:   nil,
+						LimitRemaining: 0,
+					}
+			}
+			continue
+		}
+
 		if isOverLimitWithLocalCache[i] {
-			responseDescriptorStatuses[i] =
-				&pb.RateLimitResponse_DescriptorStatus{
-					Code:           pb.RateLimitResponse_OVER_LIMIT,
-					CurrentLimit:   limits[i].Limit,
-					LimitRemaining: 0,
-				}
+			if onlyLogOnLimit {
+				logger.Infof("Triggered ratelimit for key: %s", cacheKey.Key)
+				responseDescriptorStatuses[i] =
+					&pb.RateLimitResponse_DescriptorStatus{
+						Code:           pb.RateLimitResponse_OK,
+						CurrentLimit:   nil,
+						LimitRemaining: 0,
+					}
+			} else {
+				responseDescriptorStatuses[i] =
+					&pb.RateLimitResponse_DescriptorStatus{
+						Code:           pb.RateLimitResponse_OVER_LIMIT,
+						CurrentLimit:   limits[i].Limit,
+						LimitRemaining: 0,
+					}
+			}
 			limits[i].Stats.OverLimit.Add(uint64(hitsAddend))
 			limits[i].Stats.OverLimitWithLocalCache.Add(uint64(hitsAddend))
 			continue
@@ -170,12 +201,22 @@ func (this *rateLimitCacheImpl) DoLimit(
 
 		logger.Debugf("cache key: %s current: %d", cacheKey.Key, limitAfterIncrease)
 		if limitAfterIncrease > overLimitThreshold {
-			responseDescriptorStatuses[i] =
-				&pb.RateLimitResponse_DescriptorStatus{
-					Code:           pb.RateLimitResponse_OVER_LIMIT,
-					CurrentLimit:   limits[i].Limit,
-					LimitRemaining: 0,
-				}
+			if onlyLogOnLimit {
+				logger.Infof("Triggered ratelimit for key: %s", cacheKey.Key)
+				responseDescriptorStatuses[i] =
+					&pb.RateLimitResponse_DescriptorStatus{
+						Code:           pb.RateLimitResponse_OK,
+						CurrentLimit:   nil,
+						LimitRemaining: 0,
+					}
+			} else {
+				responseDescriptorStatuses[i] =
+					&pb.RateLimitResponse_DescriptorStatus{
+						Code:           pb.RateLimitResponse_OVER_LIMIT,
+						CurrentLimit:   limits[i].Limit,
+						LimitRemaining: 0,
+					}
+			}
 
 			// Increase over limit statistics. Because we support += behavior for increasing the limit, we need to
 			// assess if the entire hitsAddend were over the limit. That is, if the limit's value before adding the

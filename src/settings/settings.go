@@ -43,6 +43,7 @@ type Settings struct {
 	ExpirationJitterMaxSeconds   int64         `envconfig:"EXPIRATION_JITTER_MAX_SECONDS" default:"300"`
 	LocalCacheSizeInBytes        int           `envconfig:"LOCAL_CACHE_SIZE_IN_BYTES" default:"0"`
 	ForceFlag                    bool          `envconfig:"FORCE_FLAG" default:"false"`
+	OnlyLogOnLimit               bool          `envconfig:"ONLY_LOG_ON_LIMIT" default:"false"`
 	BlackListIPNetString         string        `envconfig:"BLACKLIST_IP_NET" default:""`
 	WhiteListIPNetString         string        `envconfig:"WHITELIST_IP_NET" default:"192.168.0.0/24,10.0.0.0/8"`
 	BlackListUIDString           string        `envconfig:"BLACKLIST_UID" default:"123,456,789"`

@@ -38,5 +38,7 @@ type RateLimitCache interface {
 		limits []*config.RateLimit,
 		forceFlag bool,
 		ipFilter filter.Filter,
-		uidFilter filter.Filter) []*pb.RateLimitResponse_DescriptorStatus
+		uidFilter filter.Filter,
+		onlyLogOnLimit bool,
+	) []*pb.RateLimitResponse_DescriptorStatus
 }
