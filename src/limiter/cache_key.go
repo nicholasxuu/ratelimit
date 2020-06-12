@@ -91,6 +91,8 @@ func (this *CacheKeyGenerator) GenerateCacheKey(
 
 	for _, entry := range descriptor.Entries {
 		if domain == "edge_proxy_per_ip" {
+			logger.Debugf("Checking entry key: %s , entry value: %s", entry.Key, entry.Value)
+
 			if entry.Key == entryKeyRemoteAddr {
 				switch action, reason := ipFilter.Match(entry.Value); action {
 				case filter.FilterActionAllow:
