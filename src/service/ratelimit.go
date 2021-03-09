@@ -10,6 +10,7 @@ import (
 	"github.com/envoyproxy/ratelimit/src/config"
 	"github.com/envoyproxy/ratelimit/src/limiter"
 	"github.com/envoyproxy/ratelimit/src/redis"
+	"github.com/envoyproxy/ratelimit/src/settings"
 	"github.com/lyft/goruntime/loader"
 	stats "github.com/lyft/gostats"
 	logger "github.com/sirupsen/logrus"
@@ -138,7 +139,8 @@ func (this *service) shouldRateLimitWorker(
 		}
 	}
 
-	responseDescriptorStatuses := this.cache.DoLimit(ctx, request, limitsToCheck)
+	s := settings.NewSettings()
+	responseDescriptorStatuses := this.cache.DoLimit(ctx, request, limitsToCheck, s.ForceFlag, s.WhiteListIPNetList)
 	assert.Assert(len(limitsToCheck) == len(responseDescriptorStatuses))
 
 	response := &pb.RateLimitResponse{}

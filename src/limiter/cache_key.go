@@ -2,6 +2,7 @@ package limiter
 
 import (
 	"bytes"
+	"net"
 	"strconv"
 	"sync"
 
@@ -9,6 +10,7 @@ import (
 	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	"github.com/envoyproxy/ratelimit/src/config"
 	"github.com/envoyproxy/ratelimit/src/utils"
+	logger "github.com/sirupsen/logrus"
 )
 
 type CacheKeyGenerator struct {
@@ -45,7 +47,12 @@ func isPerSecondLimit(unit pb.RateLimitResponse_RateLimit_Unit) bool {
 // @param now supplies the current unix time.
 // @return CacheKey struct.
 func (this *CacheKeyGenerator) GenerateCacheKey(
-	domain string, descriptor *pb_struct.RateLimitDescriptor, limit *config.RateLimit, now int64) CacheKey {
+	domain string,
+	descriptor *pb_struct.RateLimitDescriptor,
+	limit *config.RateLimit,
+	now int64,
+	whiteListIPNet []*net.IPNet,
+) CacheKey {
 
 	if limit == nil {
 		return CacheKey{
@@ -63,6 +70,21 @@ func (this *CacheKeyGenerator) GenerateCacheKey(
 	b.WriteByte('_')
 
 	for _, entry := range descriptor.Entries {
+		if domain == "edge_proxy_per_ip" {
+			ip := net.ParseIP(entry.Value)
+			if ip != nil {
+				for _, ipNet := range whiteListIPNet {
+					if ipNet.Contains(ip) {
+						return CacheKey{
+							Key:       "",
+							PerSecond: false,
+						}
+					}
+				}
+			} else {
+				logger.Warningf("can't parse remote ip : %s", entry.Value)
+			}
+		}
 		b.WriteString(entry.Key)
 		b.WriteByte('_')
 		b.WriteString(entry.Value)

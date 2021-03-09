@@ -320,6 +320,7 @@ func NewRateLimitConfigImpl(
 
 	ret := &rateLimitConfigImpl{map[string]*rateLimitDomain{}, statsScope}
 	for _, config := range configs {
+		logger.Warnf("Loading config name : %s", config.Name)
 		ret.loadConfig(config)
 	}
 

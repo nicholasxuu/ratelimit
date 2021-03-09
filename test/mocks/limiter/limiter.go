@@ -9,6 +9,7 @@ import (
 	envoy_service_ratelimit_v3 "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	config "github.com/envoyproxy/ratelimit/src/config"
 	gomock "github.com/golang/mock/gomock"
+	"net"
 	reflect "reflect"
 )
 
@@ -36,17 +37,17 @@ func (m *MockRateLimitCache) EXPECT() *MockRateLimitCacheMockRecorder {
 }
 
 // DoLimit mocks base method
-func (m *MockRateLimitCache) DoLimit(arg0 context.Context, arg1 *envoy_service_ratelimit_v3.RateLimitRequest, arg2 []*config.RateLimit) []*envoy_service_ratelimit_v3.RateLimitResponse_DescriptorStatus {
+func (m *MockRateLimitCache) DoLimit(arg0 context.Context, arg1 *envoy_service_ratelimit_v3.RateLimitRequest, arg2 []*config.RateLimit, arg3 bool, arg4 []*net.IPNet) []*envoy_service_ratelimit_v3.RateLimitResponse_DescriptorStatus {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "DoLimit", arg0, arg1, arg2)
+	ret := m.ctrl.Call(m, "DoLimit", arg0, arg1, arg2, arg3, arg4)
 	ret0, _ := ret[0].([]*envoy_service_ratelimit_v3.RateLimitResponse_DescriptorStatus)
 	return ret0
 }
 
 // DoLimit indicates an expected call of DoLimit
-func (mr *MockRateLimitCacheMockRecorder) DoLimit(arg0, arg1, arg2 interface{}) *gomock.Call {
+func (mr *MockRateLimitCacheMockRecorder) DoLimit(arg0, arg1, arg2, arg3, arg4 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DoLimit", reflect.TypeOf((*MockRateLimitCache)(nil).DoLimit), arg0, arg1, arg2)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "DoLimit", reflect.TypeOf((*MockRateLimitCache)(nil).DoLimit), arg0, arg1, arg2, arg3, arg4)
 }
 
 // Flush mocks base method

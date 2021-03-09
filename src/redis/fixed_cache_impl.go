@@ -2,6 +2,7 @@ package redis
 
 import (
 	"math/rand"
+	"net"
 
 	"github.com/coocood/freecache"
 	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
@@ -30,7 +31,10 @@ func pipelineAppend(client Client, pipeline *Pipeline, key string, hitsAddend ui
 func (this *fixedRateLimitCacheImpl) DoLimit(
 	ctx context.Context,
 	request *pb.RateLimitRequest,
-	limits []*config.RateLimit) []*pb.RateLimitResponse_DescriptorStatus {
+	limits []*config.RateLimit,
+	forceFlag bool,
+	WhiteListIPNetList []*net.IPNet,
+) []*pb.RateLimitResponse_DescriptorStatus {
 
 	logger.Debugf("starting cache lookup")
 
@@ -38,7 +42,21 @@ func (this *fixedRateLimitCacheImpl) DoLimit(
 	hitsAddend := utils.Max(1, request.HitsAddend)
 
 	// First build a list of all cache keys that we are actually going to hit.
-	cacheKeys := this.baseRateLimiter.GenerateCacheKeys(request, limits, hitsAddend)
+	cacheKeys := this.baseRateLimiter.GenerateCacheKeys(request, limits, hitsAddend, WhiteListIPNetList)
+
+	responseDescriptorStatuses := make([]*pb.RateLimitResponse_DescriptorStatus,
+		len(request.Descriptors))
+	if forceFlag {
+		for i := range cacheKeys {
+			responseDescriptorStatuses[i] =
+				&pb.RateLimitResponse_DescriptorStatus{
+					Code:           pb.RateLimitResponse_OK,
+					CurrentLimit:   nil,
+					LimitRemaining: 0,
+				}
+		}
+		return responseDescriptorStatuses
+	}
 
 	isOverLimitWithLocalCache := make([]bool, len(request.Descriptors))
 	results := make([]uint32, len(request.Descriptors))
@@ -86,8 +104,6 @@ func (this *fixedRateLimitCacheImpl) DoLimit(
 	}
 
 	// Now fetch the pipeline.
-	responseDescriptorStatuses := make([]*pb.RateLimitResponse_DescriptorStatus,
-		len(request.Descriptors))
 	for i, cacheKey := range cacheKeys {
 
 		limitAfterIncrease := results[i]
