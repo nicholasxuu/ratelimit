@@ -1,16 +1,11 @@
 package config
 
 import (
-	pb_struct "github.com/envoyproxy/go-control-plane/envoy/api/v2/ratelimit"
-	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v2"
+	pb_struct "github.com/envoyproxy/go-control-plane/envoy/extensions/common/ratelimit/v3"
+	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	stats "github.com/lyft/gostats"
 	"golang.org/x/net/context"
 )
-
-// The NearLimitRation constant defines the ratio of total_hits over
-// the Limit's RequestPerUnit that need to happen before triggering a near_limit
-// stat increase
-const NearLimitRatio = 0.8
 
 // Errors that may be raised during config parsing.
 type RateLimitConfigError string
@@ -25,6 +20,7 @@ type RateLimitStats struct {
 	OverLimit               stats.Counter
 	NearLimit               stats.Counter
 	OverLimitWithLocalCache stats.Counter
+	WithinLimit             stats.Counter
 }
 
 // Wrapper for an individual rate limit config entry which includes the defined limit and stats.

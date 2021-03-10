@@ -1,14 +1,16 @@
 package ratelimit
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 
-	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v2"
+	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	"github.com/envoyproxy/ratelimit/src/assert"
 	"github.com/envoyproxy/ratelimit/src/config"
 	"github.com/envoyproxy/ratelimit/src/limiter"
 	"github.com/envoyproxy/ratelimit/src/redis"
+	"github.com/envoyproxy/ratelimit/src/settings"
 	"github.com/lyft/goruntime/loader"
 	stats "github.com/lyft/gostats"
 	logger "github.com/sirupsen/logrus"
@@ -57,6 +59,7 @@ type service struct {
 	stats              serviceStats
 	rlStatsScope       stats.Scope
 	legacy             *legacyService
+	runtimeWatchRoot   bool
 }
 
 func (this *service) reloadConfig() {
@@ -75,7 +78,7 @@ func (this *service) reloadConfig() {
 	files := []config.RateLimitConfigToLoad{}
 	snapshot := this.runtime.Snapshot()
 	for _, key := range snapshot.Keys() {
-		if !strings.HasPrefix(key, "config.") {
+		if this.runtimeWatchRoot && !strings.HasPrefix(key, "config.") {
 			continue
 		}
 
@@ -112,10 +115,32 @@ func (this *service) shouldRateLimitWorker(
 
 	limitsToCheck := make([]*config.RateLimit, len(request.Descriptors))
 	for i, descriptor := range request.Descriptors {
+		if logger.IsLevelEnabled(logger.DebugLevel) {
+			var descriptorEntryStrings []string
+			for _, descriptorEntry := range descriptor.GetEntries() {
+				descriptorEntryStrings = append(
+					descriptorEntryStrings,
+					fmt.Sprintf("(%s=%s)", descriptorEntry.Key, descriptorEntry.Value),
+				)
+			}
+			logger.Debugf("got descriptor: %s", strings.Join(descriptorEntryStrings, ","))
+		}
 		limitsToCheck[i] = snappedConfig.GetLimit(ctx, request.Domain, descriptor)
+		if logger.IsLevelEnabled(logger.DebugLevel) {
+			if limitsToCheck[i] == nil {
+				logger.Debugf("descriptor does not match any limit, no limits applied")
+			} else {
+				logger.Debugf(
+					"applying limit: %d requests per %s",
+					limitsToCheck[i].Limit.RequestsPerUnit,
+					limitsToCheck[i].Limit.Unit.String(),
+				)
+			}
+		}
 	}
 
-	responseDescriptorStatuses := this.cache.DoLimit(ctx, request, limitsToCheck)
+	s := settings.NewSettings()
+	responseDescriptorStatuses := this.cache.DoLimit(ctx, request, limitsToCheck, s.ForceFlag, s.WhiteListIPNetList)
 	assert.Assert(len(limitsToCheck) == len(responseDescriptorStatuses))
 
 	response := &pb.RateLimitResponse{}
@@ -176,7 +201,7 @@ func (this *service) GetCurrentConfig() config.RateLimitConfig {
 }
 
 func NewService(runtime loader.IFace, cache limiter.RateLimitCache,
-	configLoader config.RateLimitConfigLoader, stats stats.Scope) RateLimitServiceServer {
+	configLoader config.RateLimitConfigLoader, stats stats.Scope, runtimeWatchRoot bool) RateLimitServiceServer {
 
 	newService := &service{
 		runtime:            runtime,
@@ -187,6 +212,7 @@ func NewService(runtime loader.IFace, cache limiter.RateLimitCache,
 		cache:              cache,
 		stats:              newServiceStats(stats),
 		rlStatsScope:       stats.Scope("rate_limit"),
+		runtimeWatchRoot:   runtimeWatchRoot,
 	}
 	newService.legacy = &legacyService{
 		s:                          newService,

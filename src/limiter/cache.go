@@ -1,24 +1,12 @@
 package limiter
 
 import (
-	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v2"
+	"net"
+
+	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	"github.com/envoyproxy/ratelimit/src/config"
 	"golang.org/x/net/context"
 )
-
-// Interface for a time source.
-type TimeSource interface {
-	// @return the current unix time in seconds.
-	UnixNow() int64
-}
-
-// Interface for a rand Source for expiration jitter.
-type JitterRandSource interface {
-	// @return a non-negative pseudo-random 63-bit integer as an int64.
-	Int63() int64
-	// @param seed initializes pseudo-random generator to a deterministic state.
-	Seed(seed int64)
-}
 
 // Interface for interacting with a cache backend for rate limiting.
 type RateLimitCache interface {
@@ -34,5 +22,10 @@ type RateLimitCache interface {
 	DoLimit(
 		ctx context.Context,
 		request *pb.RateLimitRequest,
-		limits []*config.RateLimit) []*pb.RateLimitResponse_DescriptorStatus
+		limits []*config.RateLimit,
+		forceFlag bool,
+		WhiteListIPNetList []*net.IPNet) []*pb.RateLimitResponse_DescriptorStatus
+	// Waits for any unfinished asynchronous work. This may be used by unit tests,
+	// since the memcache cache does increments in a background gorountine.
+	Flush()
 }

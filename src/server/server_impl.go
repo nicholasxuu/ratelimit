@@ -1,13 +1,15 @@
 package server
 
 import (
-	"encoding/json"
+	"bytes"
 	"expvar"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/pprof"
+	"path/filepath"
 	"sort"
+	"sync"
 
 	"os"
 	"os/signal"
@@ -16,9 +18,10 @@ import (
 	"net"
 
 	"github.com/coocood/freecache"
-	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v2"
+	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
 	"github.com/envoyproxy/ratelimit/src/limiter"
 	"github.com/envoyproxy/ratelimit/src/settings"
+	"github.com/golang/protobuf/jsonpb"
 	"github.com/gorilla/mux"
 	reuseport "github.com/kavu/go_reuseport"
 	"github.com/lyft/goruntime/loader"
@@ -45,23 +48,30 @@ type server struct {
 	scope         stats.Scope
 	runtime       loader.IFace
 	debugListener serverDebugListener
+	httpServer    *http.Server
+	listenerMu    sync.Mutex
 	health        *HealthChecker
 }
 
 func (server *server) AddDebugHttpEndpoint(path string, help string, handler http.HandlerFunc) {
+	server.listenerMu.Lock()
+	defer server.listenerMu.Unlock()
 	server.debugListener.debugMux.HandleFunc(path, handler)
 	server.debugListener.endpoints[path] = help
 }
 
-// add an http/1 handler at the /json endpoint which allows this ratelimit service to work with
+// create an http/1 handler at the /json endpoint which allows this ratelimit service to work with
 // clients that cannot use the gRPC interface (e.g. lua)
 // example usage from cURL with domain "dummy" and descriptor "perday":
 // echo '{"domain": "dummy", "descriptors": [{"entries": [{"key": "perday"}]}]}' | curl -vvvXPOST --data @/dev/stdin localhost:8080/json
-func (server *server) AddJsonHandler(svc pb.RateLimitServiceServer) {
-	handler := func(writer http.ResponseWriter, request *http.Request) {
+func NewJsonHandler(svc pb.RateLimitServiceServer) func(http.ResponseWriter, *http.Request) {
+	// Default options include enums as strings and no identation.
+	m := &jsonpb.Marshaler{}
+
+	return func(writer http.ResponseWriter, request *http.Request) {
 		var req pb.RateLimitRequest
 
-		if err := json.NewDecoder(request.Body).Decode(&req); err != nil {
+		if err := jsonpb.Unmarshal(request.Body, &req); err != nil {
 			logger.Warnf("error: %s", err.Error())
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
@@ -73,15 +83,29 @@ func (server *server) AddJsonHandler(svc pb.RateLimitServiceServer) {
 			http.Error(writer, err.Error(), http.StatusBadRequest)
 			return
 		}
+
 		logger.Debugf("resp:%s", resp)
-		if resp.OverallCode == pb.RateLimitResponse_OVER_LIMIT {
-			http.Error(writer, "over limit", http.StatusTooManyRequests)
-		} else if resp.OverallCode == pb.RateLimitResponse_UNKNOWN {
-			http.Error(writer, "unknown", http.StatusInternalServerError)
+
+		buf := bytes.NewBuffer(nil)
+		err = m.Marshal(buf, resp)
+		if err != nil {
+			logger.Errorf("error marshaling proto3 to json: %s", err.Error())
+			http.Error(writer, "error marshaling proto3 to json: "+err.Error(), http.StatusInternalServerError)
+			return
 		}
 
+		writer.Header().Set("Content-Type", "application/json")
+		if resp == nil || resp.OverallCode == pb.RateLimitResponse_UNKNOWN {
+			writer.WriteHeader(http.StatusInternalServerError)
+		} else if resp.OverallCode == pb.RateLimitResponse_OVER_LIMIT {
+			writer.WriteHeader(http.StatusTooManyRequests)
+		}
+		writer.Write(buf.Bytes())
 	}
-	server.router.HandleFunc("/json", handler)
+}
+
+func (server *server) AddJsonHandler(svc pb.RateLimitServiceServer) {
+	server.router.HandleFunc("/json", NewJsonHandler(svc))
 }
 
 func (server *server) GrpcServer() *grpc.Server {
@@ -93,7 +117,9 @@ func (server *server) Start() {
 		addr := fmt.Sprintf(":%d", server.debugPort)
 		logger.Warnf("Listening for debug on '%s'", addr)
 		var err error
+		server.listenerMu.Lock()
 		server.debugListener.listener, err = reuseport.Listen("tcp", addr)
+		server.listenerMu.Unlock()
 
 		if err != nil {
 			logger.Errorf("Failed to open debug HTTP listener: '%+v'", err)
@@ -113,7 +139,15 @@ func (server *server) Start() {
 	if err != nil {
 		logger.Fatalf("Failed to open HTTP listener: '%+v'", err)
 	}
-	logger.Fatal(http.Serve(list, server.router))
+	srv := &http.Server{Handler: server.router}
+	server.listenerMu.Lock()
+	server.httpServer = srv
+	server.listenerMu.Unlock()
+	err = srv.Serve(list)
+
+	if err != http.ErrServerClosed {
+		logger.Fatal(err)
+	}
 }
 
 func (server *server) startGrpc() {
@@ -134,13 +168,11 @@ func (server *server) Runtime() loader.IFace {
 	return server.runtime
 }
 
-func NewServer(name string, store stats.Store, localCache *freecache.Cache, opts ...settings.Option) Server {
-	return newServer(name, store, localCache, opts...)
+func NewServer(s settings.Settings, name string, store stats.Store, localCache *freecache.Cache, opts ...settings.Option) Server {
+	return newServer(s, name, store, localCache, opts...)
 }
 
-func newServer(name string, store stats.Store, localCache *freecache.Cache, opts ...settings.Option) *server {
-	s := settings.NewSettings()
-
+func newServer(s settings.Settings, name string, store stats.Store, localCache *freecache.Cache, opts ...settings.Option) *server {
 	for _, opt := range opts {
 		opt(&s)
 	}
@@ -155,7 +187,7 @@ func newServer(name string, store stats.Store, localCache *freecache.Cache, opts
 
 	// setup stats
 	ret.store = store
-	ret.scope = ret.store.Scope(name)
+	ret.scope = ret.store.ScopeWithTags(name, s.ExtraTags)
 	ret.store.AddStatGenerator(stats.NewRuntimeStats(ret.scope.Scope("go")))
 	if localCache != nil {
 		ret.store.AddStatGenerator(limiter.NewLocalCacheStats(localCache, ret.scope.Scope("localcache")))
@@ -169,12 +201,22 @@ func newServer(name string, store stats.Store, localCache *freecache.Cache, opts
 		loaderOpts = append(loaderOpts, loader.AllowDotFiles)
 	}
 
-	ret.runtime = loader.New(
-		s.RuntimePath,
-		s.RuntimeSubdirectory,
-		ret.store.Scope("runtime"),
-		&loader.SymlinkRefresher{RuntimePath: s.RuntimePath},
-		loaderOpts...)
+	if s.RuntimeWatchRoot {
+		ret.runtime = loader.New(
+			s.RuntimePath,
+			s.RuntimeSubdirectory,
+			ret.store.ScopeWithTags("runtime", s.ExtraTags),
+			&loader.SymlinkRefresher{RuntimePath: s.RuntimePath},
+			loaderOpts...)
+
+	} else {
+		ret.runtime = loader.New(
+			filepath.Join(s.RuntimePath, s.RuntimeSubdirectory),
+			"config",
+			ret.store.ScopeWithTags("runtime", s.ExtraTags),
+			&loader.DirectoryRefresher{},
+			loaderOpts...)
+	}
 
 	// setup http router
 	ret.router = mux.NewRouter()
@@ -192,6 +234,14 @@ func newServer(name string, store stats.Store, localCache *freecache.Cache, opts
 		"root of various pprof endpoints. hit for help.",
 		func(writer http.ResponseWriter, request *http.Request) {
 			pprof.Index(writer, request)
+		})
+
+	// setup cpu profiling endpoint
+	ret.AddDebugHttpEndpoint(
+		"/debug/pprof/profile",
+		"CPU profiling endpoint",
+		func(writer http.ResponseWriter, request *http.Request) {
+			pprof.Profile(writer, request)
 		})
 
 	// setup stats endpoint
@@ -223,6 +273,18 @@ func newServer(name string, store stats.Store, localCache *freecache.Cache, opts
 	return ret
 }
 
+func (server *server) Stop() {
+	server.grpcServer.GracefulStop()
+	server.listenerMu.Lock()
+	if server.debugListener.listener != nil {
+		server.debugListener.listener.Close()
+	}
+	if server.httpServer != nil {
+		server.httpServer.Close()
+	}
+	server.listenerMu.Unlock()
+}
+
 func (server *server) handleGracefulShutdown() {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
@@ -232,9 +294,14 @@ func (server *server) handleGracefulShutdown() {
 
 		logger.Infof("Ratelimit server received %v, shutting down gracefully", sig)
 		server.grpcServer.GracefulStop()
+		server.listenerMu.Lock()
 		if server.debugListener.listener != nil {
 			server.debugListener.listener.Close()
 		}
+		if server.httpServer != nil {
+			server.httpServer.Close()
+		}
+		server.listenerMu.Unlock()
 		os.Exit(0)
 	}()
 }

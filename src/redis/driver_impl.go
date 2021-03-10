@@ -3,6 +3,7 @@ package redis
 import (
 	"crypto/tls"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mediocregopher/radix/v3/trace"
@@ -40,8 +41,9 @@ func poolTrace(ps *poolStats) trace.PoolTrace {
 }
 
 type clientImpl struct {
-	client radix.Client
-	stats  poolStats
+	client             radix.Client
+	stats              poolStats
+	implicitPipelining bool
 }
 
 func checkError(err error) {
@@ -50,7 +52,7 @@ func checkError(err error) {
 	}
 }
 
-func NewClientImpl(scope stats.Scope, useTls bool, auth string, url string, poolSize int,
+func NewClientImpl(scope stats.Scope, useTls bool, auth string, redisType string, url string, poolSize int,
 	pipelineWindow time.Duration, pipelineLimit int) Client {
 	logger.Warnf("connecting to redis on %s with pool size %d", url, poolSize)
 
@@ -76,23 +78,55 @@ func NewClientImpl(scope stats.Scope, useTls bool, auth string, url string, pool
 
 	stats := newPoolStats(scope)
 
-	// TODO: support sentinel and redis cluster
-	pool, err := radix.NewPool("tcp", url, poolSize, radix.PoolConnFunc(df),
-		radix.PoolPipelineWindow(pipelineWindow, pipelineLimit),
-		radix.PoolWithTrace(poolTrace(&stats)),
-	)
+	opts := []radix.PoolOpt{radix.PoolConnFunc(df), radix.PoolWithTrace(poolTrace(&stats))}
+
+	implicitPipelining := true
+	if pipelineWindow == 0 && pipelineLimit == 0 {
+		implicitPipelining = false
+	} else {
+		opts = append(opts, radix.PoolPipelineWindow(pipelineWindow, pipelineLimit))
+	}
+	logger.Debugf("Implicit pipelining enabled: %v", implicitPipelining)
+
+	poolFunc := func(network, addr string) (radix.Client, error) {
+		return radix.NewPool(network, addr, poolSize, opts...)
+	}
+
+	var client radix.Client
+	var err error
+	switch strings.ToLower(redisType) {
+	case "single":
+		client, err = poolFunc("tcp", url)
+	case "cluster":
+		urls := strings.Split(url, ",")
+		if implicitPipelining == false {
+			panic(RedisError("Implicit Pipelining must be enabled to work with Redis Cluster Mode. Set values for REDIS_PIPELINE_WINDOW or REDIS_PIPELINE_LIMIT to enable implicit pipelining"))
+		}
+		logger.Warnf("Creating cluster with urls %v", urls)
+		client, err = radix.NewCluster(urls, radix.ClusterPoolFunc(poolFunc))
+	case "sentinel":
+		urls := strings.Split(url, ",")
+		if len(urls) < 2 {
+			panic(RedisError("Expected master name and a list of urls for the sentinels, in the format: <redis master name>,<sentinel1>,...,<sentineln>"))
+		}
+		client, err = radix.NewSentinel(urls[0], urls[1:], radix.SentinelPoolFunc(poolFunc))
+	default:
+		panic(RedisError("Unrecognized redis type " + redisType))
+	}
+
 	checkError(err)
 
 	// Check if connection is good
 	var pingResponse string
-	checkError(pool.Do(radix.Cmd(&pingResponse, "PING")))
+	checkError(client.Do(radix.Cmd(&pingResponse, "PING")))
 	if pingResponse != "PONG" {
 		checkError(fmt.Errorf("connecting redis error: %s", pingResponse))
 	}
 
 	return &clientImpl{
-		client: pool,
-		stats:  stats,
+		client:             client,
+		stats:              stats,
+		implicitPipelining: implicitPipelining,
 	}
 }
 
@@ -106,4 +140,25 @@ func (c *clientImpl) Close() error {
 
 func (c *clientImpl) NumActiveConns() int {
 	return int(c.stats.connectionActive.Value())
+}
+
+func (c *clientImpl) PipeAppend(pipeline Pipeline, rcv interface{}, cmd, key string, args ...interface{}) Pipeline {
+	return append(pipeline, radix.FlatCmd(rcv, cmd, key, args...))
+}
+
+func (c *clientImpl) PipeDo(pipeline Pipeline) error {
+	if c.implicitPipelining {
+		for _, action := range pipeline {
+			if err := c.client.Do(action); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	return c.client.Do(radix.Pipeline(pipeline...))
+}
+
+func (c *clientImpl) ImplicitPipeliningEnabled() bool {
+	return c.implicitPipelining
 }

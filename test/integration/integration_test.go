@@ -3,97 +3,344 @@
 package integration_test
 
 import (
-	"bytes"
 	"fmt"
+	"io"
 	"math/rand"
-	"net/http"
 	"os"
 	"strconv"
 	"testing"
 	"time"
 
-	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v2"
-	pb_legacy "github.com/envoyproxy/ratelimit/proto/ratelimit"
+	pb_legacy "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v2"
+	pb "github.com/envoyproxy/go-control-plane/envoy/service/ratelimit/v3"
+	"github.com/envoyproxy/ratelimit/src/memcached"
 	"github.com/envoyproxy/ratelimit/src/service_cmd/runner"
+	"github.com/envoyproxy/ratelimit/src/settings"
 	"github.com/envoyproxy/ratelimit/test/common"
+	"github.com/golang/protobuf/ptypes/duration"
+	"github.com/kelseyhightower/envconfig"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 )
 
-func newDescriptorStatus(
-	status pb.RateLimitResponse_Code, requestsPerUnit uint32,
-	unit pb.RateLimitResponse_RateLimit_Unit, limitRemaining uint32) *pb.RateLimitResponse_DescriptorStatus {
+func init() {
+	os.Setenv("USE_STATSD", "false")
+	// Memcache does async increments, which can cause race conditions during
+	// testing. Force sync increments so the quotas are predictable during testing.
+	memcached.AutoFlushForIntegrationTests = true
+}
+
+func defaultSettings() settings.Settings {
+	// Fetch the default setting values.
+	var s settings.Settings
+	err := envconfig.Process("UNLIKELY_PREFIX_", &s)
+	if err != nil {
+		panic(err)
+	}
+
+	// Set some convenient defaults for all integration tests.
+	s.RuntimePath = "runtime/current"
+	s.RuntimeSubdirectory = "ratelimit"
+	s.RedisPerSecondSocketType = "tcp"
+	s.RedisSocketType = "tcp"
+	s.DebugPort = 8084
+	s.UseStatsd = false
+	s.Port = 8082
+	s.GrpcPort = 8083
+
+	return s
+}
+
+func newDescriptorStatus(status pb.RateLimitResponse_Code, requestsPerUnit uint32, unit pb.RateLimitResponse_RateLimit_Unit, limitRemaining uint32, durRemaining *duration.Duration) *pb.RateLimitResponse_DescriptorStatus {
+
+	limit := &pb.RateLimitResponse_RateLimit{RequestsPerUnit: requestsPerUnit, Unit: unit}
 
 	return &pb.RateLimitResponse_DescriptorStatus{
-		Code:           status,
-		CurrentLimit:   &pb.RateLimitResponse_RateLimit{RequestsPerUnit: requestsPerUnit, Unit: unit},
-		LimitRemaining: limitRemaining,
+		Code:               status,
+		CurrentLimit:       limit,
+		LimitRemaining:     limitRemaining,
+		DurationUntilReset: &duration.Duration{Seconds: durRemaining.GetSeconds()},
 	}
 }
 
 func newDescriptorStatusLegacy(
 	status pb_legacy.RateLimitResponse_Code, requestsPerUnit uint32,
-	unit pb_legacy.RateLimit_Unit, limitRemaining uint32) *pb_legacy.RateLimitResponse_DescriptorStatus {
+	unit pb_legacy.RateLimitResponse_RateLimit_Unit, limitRemaining uint32) *pb_legacy.RateLimitResponse_DescriptorStatus {
 
 	return &pb_legacy.RateLimitResponse_DescriptorStatus{
 		Code:           status,
-		CurrentLimit:   &pb_legacy.RateLimit{RequestsPerUnit: requestsPerUnit, Unit: unit},
+		CurrentLimit:   &pb_legacy.RateLimitResponse_RateLimit{RequestsPerUnit: requestsPerUnit, Unit: unit},
 		LimitRemaining: limitRemaining,
 	}
 }
 
-// TODO: Once adding the ability of stopping the server in the runner (https://github.com/envoyproxy/ratelimit/issues/119),
-//  stop the server at the end of each test, thus we can reuse the grpc port among these integration tests.
+func makeSimpleRedisSettings(redisPort int, perSecondPort int, perSecond bool, localCacheSize int) settings.Settings {
+	s := defaultSettings()
+
+	s.RedisPerSecond = perSecond
+	s.LocalCacheSizeInBytes = localCacheSize
+	s.BackendType = "redis"
+	s.RedisUrl = "localhost:" + strconv.Itoa(redisPort)
+	s.RedisPerSecondUrl = "localhost:" + strconv.Itoa(perSecondPort)
+	return s
+}
+
 func TestBasicConfig(t *testing.T) {
-	t.Run("WithoutPerSecondRedis", testBasicConfig("8083", "false", "0"))
-	t.Run("WithPerSecondRedis", testBasicConfig("8085", "true", "0"))
-	t.Run("WithoutPerSecondRedisWithLocalCache", testBasicConfig("18083", "false", "1000"))
-	t.Run("WithPerSecondRedisWithLocalCache", testBasicConfig("18085", "true", "1000"))
+	common.WithMultiRedis(t, []common.RedisConfig{
+		{Port: 6383},
+		{Port: 6380},
+	}, func() {
+		t.Run("WithoutPerSecondRedis", testBasicConfig(makeSimpleRedisSettings(6383, 6380, false, 0)))
+		t.Run("WithPerSecondRedis", testBasicConfig(makeSimpleRedisSettings(6383, 6380, true, 0)))
+		t.Run("WithoutPerSecondRedisWithLocalCache", testBasicConfig(makeSimpleRedisSettings(6383, 6380, false, 1000)))
+		t.Run("WithPerSecondRedisWithLocalCache", testBasicConfig(makeSimpleRedisSettings(6383, 6380, true, 1000)))
+		cacheSettings := makeSimpleRedisSettings(6383, 6380, false, 0)
+		cacheSettings.CacheKeyPrefix = "prefix:"
+		t.Run("WithoutPerSecondRedisWithCachePrefix", testBasicConfig(cacheSettings))
+	})
+}
+
+func TestBasicConfig_ExtraTags(t *testing.T) {
+	common.WithMultiRedis(t, []common.RedisConfig{
+		{Port: 6383},
+	}, func() {
+		extraTagsSettings := makeSimpleRedisSettings(6383, 6380, false, 0)
+		extraTagsSettings.ExtraTags = map[string]string{"foo": "bar", "a": "b"}
+		runner := startTestRunner(t, extraTagsSettings)
+		defer runner.Stop()
+
+		assert := assert.New(t)
+		conn, err := grpc.Dial(fmt.Sprintf("localhost:%v", extraTagsSettings.GrpcPort), grpc.WithInsecure())
+		assert.NoError(err)
+		defer conn.Close()
+		c := pb.NewRateLimitServiceClient(conn)
+
+		_, err = c.ShouldRateLimit(
+			context.Background(),
+			common.NewRateLimitRequest("basic", [][][2]string{{{getCacheKey("key1", false), "foo"}}}, 1))
+		assert.NoError(err)
+
+		// Manually flush the cache for local_cache stats
+		runner.GetStatsStore().Flush()
+
+		// store.NewCounter returns the existing counter.
+		// This test looks for the extra tags requested.
+		key1HitCounter := runner.GetStatsStore().NewCounterWithTags(
+			fmt.Sprintf("ratelimit.service.rate_limit.basic.%s.total_hits", getCacheKey("key1", false)),
+			extraTagsSettings.ExtraTags)
+		assert.Equal(1, int(key1HitCounter.Value()))
+
+		configLoadStat := runner.GetStatsStore().NewCounterWithTags(
+			"ratelimit.service.config_load_success",
+			extraTagsSettings.ExtraTags)
+		assert.Equal(1, int(configLoadStat.Value()))
+
+		// NOTE: This doesn't currently test that the extra tags are present for:
+		// - local cache
+		// - go runtime stats.
+	})
 }
 
 func TestBasicTLSConfig(t *testing.T) {
-	t.Run("WithoutPerSecondRedisTLS", testBasicConfigAuthTLS("8087", "false", "0"))
-	t.Run("WithPerSecondRedisTLS", testBasicConfigAuthTLS("8089", "true", "0"))
-	t.Run("WithoutPerSecondRedisTLSWithLocalCache", testBasicConfigAuthTLS("18087", "false", "1000"))
-	t.Run("WithPerSecondRedisTLSWithLocalCache", testBasicConfigAuthTLS("18089", "true", "1000"))
+	t.Run("WithoutPerSecondRedisTLS", testBasicConfigAuthTLS(false, 0))
+	t.Run("WithPerSecondRedisTLS", testBasicConfigAuthTLS(true, 0))
+	t.Run("WithoutPerSecondRedisTLSWithLocalCache", testBasicConfigAuthTLS(false, 1000))
+	t.Run("WithPerSecondRedisTLSWithLocalCache", testBasicConfigAuthTLS(true, 1000))
 }
 
 func TestBasicAuthConfig(t *testing.T) {
-	t.Run("WithoutPerSecondRedisAuth", testBasicConfigAuth("8091", "false", "0"))
-	t.Run("WithPerSecondRedisAuth", testBasicConfigAuth("8093", "true", "0"))
-	t.Run("WithoutPerSecondRedisAuthWithLocalCache", testBasicConfigAuth("18091", "false", "1000"))
-	t.Run("WithPerSecondRedisAuthWithLocalCache", testBasicConfigAuth("18093", "true", "1000"))
+	common.WithMultiRedis(t, []common.RedisConfig{
+		{Port: 6384, Password: "password123"},
+		{Port: 6385, Password: "password123"},
+	}, func() {
+		t.Run("WithoutPerSecondRedisAuth", testBasicConfigAuth(false, 0))
+		t.Run("WithPerSecondRedisAuth", testBasicConfigAuth(true, 0))
+		t.Run("WithoutPerSecondRedisAuthWithLocalCache", testBasicConfigAuth(false, 1000))
+		t.Run("WithPerSecondRedisAuthWithLocalCache", testBasicConfigAuth(true, 1000))
+	})
 }
 
-func testBasicConfigAuthTLS(grpcPort, perSecond string, local_cache_size string) func(*testing.T) {
-	os.Setenv("REDIS_PERSECOND_URL", "localhost:16382")
-	os.Setenv("REDIS_URL", "localhost:16381")
-	os.Setenv("REDIS_AUTH", "password123")
-	os.Setenv("REDIS_TLS", "true")
-	os.Setenv("REDIS_PERSECOND_AUTH", "password123")
-	os.Setenv("REDIS_PERSECOND_TLS", "true")
-	return testBasicBaseConfig(grpcPort, perSecond, local_cache_size)
+func TestBasicAuthConfigWithRedisCluster(t *testing.T) {
+	t.Run("WithoutPerSecondRedisAuth", testBasicConfigAuthWithRedisCluster(false, 0))
+	t.Run("WithPerSecondRedisAuth", testBasicConfigAuthWithRedisCluster(true, 0))
+	t.Run("WithoutPerSecondRedisAuthWithLocalCache", testBasicConfigAuthWithRedisCluster(false, 1000))
+	t.Run("WithPerSecondRedisAuthWithLocalCache", testBasicConfigAuthWithRedisCluster(true, 1000))
 }
 
-func testBasicConfig(grpcPort, perSecond string, local_cache_size string) func(*testing.T) {
-	os.Setenv("REDIS_PERSECOND_URL", "localhost:6380")
-	os.Setenv("REDIS_URL", "localhost:6379")
-	os.Setenv("REDIS_AUTH", "")
-	os.Setenv("REDIS_TLS", "false")
-	os.Setenv("REDIS_PERSECOND_AUTH", "")
-	os.Setenv("REDIS_PERSECOND_TLS", "false")
-	return testBasicBaseConfig(grpcPort, perSecond, local_cache_size)
+func TestBasicAuthConfigWithRedisSentinel(t *testing.T) {
+	t.Run("WithoutPerSecondRedisAuth", testBasicAuthConfigWithRedisSentinel(false, 0))
+	t.Run("WithPerSecondRedisAuth", testBasicAuthConfigWithRedisSentinel(true, 0))
+	t.Run("WithoutPerSecondRedisAuthWithLocalCache", testBasicAuthConfigWithRedisSentinel(false, 1000))
+	t.Run("WithPerSecondRedisAuthWithLocalCache", testBasicAuthConfigWithRedisSentinel(true, 1000))
 }
 
-func testBasicConfigAuth(grpcPort, perSecond string, local_cache_size string) func(*testing.T) {
-	os.Setenv("REDIS_PERSECOND_URL", "localhost:6385")
-	os.Setenv("REDIS_URL", "localhost:6384")
-	os.Setenv("REDIS_TLS", "false")
-	os.Setenv("REDIS_AUTH", "password123")
-	os.Setenv("REDIS_PERSECOND_TLS", "false")
-	os.Setenv("REDIS_PERSECOND_AUTH", "password123")
-	return testBasicBaseConfig(grpcPort, perSecond, local_cache_size)
+func TestBasicReloadConfig(t *testing.T) {
+	common.WithMultiRedis(t, []common.RedisConfig{
+		{Port: 6383},
+	}, func() {
+		t.Run("BasicWithoutWatchRoot", testBasicConfigWithoutWatchRoot(false, 0))
+		t.Run("ReloadWithoutWatchRoot", testBasicConfigReload(false, 0, false))
+	})
+}
+
+func makeSimpleMemcacheSettings(memcachePort int, localCacheSize int) settings.Settings {
+	s := defaultSettings()
+
+	s.MemcacheHostPort = "localhost:" + strconv.Itoa(memcachePort)
+	s.LocalCacheSizeInBytes = localCacheSize
+	s.BackendType = "memcache"
+	return s
+}
+
+func TestBasicConfigMemcache(t *testing.T) {
+	common.WithMultiMemcache(t, []common.MemcacheConfig{
+		{Port: 6394},
+	}, func() {
+		t.Run("Memcache", testBasicConfig(makeSimpleMemcacheSettings(6394, 0)))
+		t.Run("MemcacheWithLocalCache", testBasicConfig(makeSimpleMemcacheSettings(6394, 1000)))
+		cacheSettings := makeSimpleMemcacheSettings(6394, 0)
+		cacheSettings.CacheKeyPrefix = "prefix:"
+		t.Run("MemcacheWithPrefix", testBasicConfig(cacheSettings))
+	})
+}
+
+func testBasicConfigAuthTLS(perSecond bool, local_cache_size int) func(*testing.T) {
+	s := makeSimpleRedisSettings(16381, 16382, perSecond, local_cache_size)
+	s.RedisAuth = "password123"
+	s.RedisTls = true
+	s.RedisPerSecondAuth = "password123"
+	s.RedisPerSecondTls = true
+
+	return testBasicBaseConfig(s)
+}
+
+func testBasicConfig(s settings.Settings) func(*testing.T) {
+	return testBasicBaseConfig(s)
+}
+
+func testBasicConfigAuth(perSecond bool, local_cache_size int) func(*testing.T) {
+	s := makeSimpleRedisSettings(6384, 6385, perSecond, local_cache_size)
+	s.RedisAuth = "password123"
+	s.RedisPerSecondAuth = "password123"
+
+	return testBasicBaseConfig(s)
+}
+
+func testBasicConfigAuthWithRedisCluster(perSecond bool, local_cache_size int) func(*testing.T) {
+	s := defaultSettings()
+
+	s.RedisPerSecond = perSecond
+	s.LocalCacheSizeInBytes = local_cache_size
+	s.BackendType = "redis"
+
+	configRedisCluster(&s)
+
+	return testBasicBaseConfig(s)
+}
+
+func configRedisSentinel(s *settings.Settings) {
+	s.RedisPerSecondType = "sentinel"
+
+	s.RedisPerSecondUrl = "mymaster,localhost:26399,localhost:26400,localhost:26401"
+	s.RedisType = "sentinel"
+	s.RedisUrl = "mymaster,localhost:26394,localhost:26395,localhost:26396"
+	s.RedisAuth = "password123"
+	s.RedisPerSecondAuth = "password123"
+}
+
+func testBasicAuthConfigWithRedisSentinel(perSecond bool, local_cache_size int) func(*testing.T) {
+	s := defaultSettings()
+
+	s.RedisPerSecond = perSecond
+	s.LocalCacheSizeInBytes = local_cache_size
+	s.BackendType = "redis"
+
+	configRedisSentinel(&s)
+
+	return testBasicBaseConfig(s)
+}
+
+func testBasicConfigWithoutWatchRoot(perSecond bool, local_cache_size int) func(*testing.T) {
+	s := makeSimpleRedisSettings(6383, 6380, perSecond, local_cache_size)
+	s.RuntimeWatchRoot = false
+
+	return testBasicBaseConfig(s)
+}
+
+func configRedisCluster(s *settings.Settings) {
+	s.RedisPerSecondType = "cluster"
+	s.RedisPerSecondUrl = "localhost:6389,localhost:6390,localhost:6391"
+	s.RedisType = "cluster"
+	s.RedisUrl = "localhost:6386,localhost:6387,localhost:6388"
+
+	s.RedisAuth = "password123"
+	s.RedisPerSecondAuth = "password123"
+
+	s.RedisPerSecondPipelineLimit = 8
+	s.RedisPipelineLimit = 8
+}
+
+func testBasicConfigWithoutWatchRootWithRedisCluster(perSecond bool, local_cache_size int) func(*testing.T) {
+	s := defaultSettings()
+
+	s.RedisPerSecond = perSecond
+	s.LocalCacheSizeInBytes = local_cache_size
+	s.BackendType = "redis"
+
+	s.RuntimeWatchRoot = false
+
+	configRedisCluster(&s)
+
+	return testBasicBaseConfig(s)
+}
+
+func testBasicConfigWithoutWatchRootWithRedisSentinel(perSecond bool, local_cache_size int) func(*testing.T) {
+	s := defaultSettings()
+
+	s.RedisPerSecond = perSecond
+	s.LocalCacheSizeInBytes = local_cache_size
+	s.BackendType = "redis"
+
+	configRedisSentinel(&s)
+
+	s.RuntimeWatchRoot = false
+
+	return testBasicBaseConfig(s)
+}
+
+func testBasicConfigReload(perSecond bool, local_cache_size int, runtimeWatchRoot bool) func(*testing.T) {
+	s := makeSimpleRedisSettings(6383, 6380, perSecond, local_cache_size)
+	s.RuntimeWatchRoot = runtimeWatchRoot
+	return testConfigReload(s)
+}
+
+func testBasicConfigReloadWithRedisCluster(perSecond bool, local_cache_size int, runtimeWatchRoot string) func(*testing.T) {
+	s := defaultSettings()
+
+	s.RedisPerSecond = perSecond
+	s.LocalCacheSizeInBytes = local_cache_size
+	s.BackendType = "redis"
+
+	s.RuntimeWatchRoot = s.RuntimeWatchRoot
+
+	configRedisCluster(&s)
+
+	return testConfigReload(s)
+}
+
+func testBasicConfigReloadWithRedisSentinel(perSecond bool, local_cache_size int, runtimeWatchRoot bool) func(*testing.T) {
+	s := defaultSettings()
+
+	s.RedisPerSecond = perSecond
+	s.LocalCacheSizeInBytes = local_cache_size
+	s.BackendType = "redis"
+
+	configRedisSentinel(&s)
+
+	s.RuntimeWatchRoot = runtimeWatchRoot
+
+	return testConfigReload(s)
 }
 
 func getCacheKey(cacheKey string, enableLocalCache bool) string {
@@ -104,32 +351,14 @@ func getCacheKey(cacheKey string, enableLocalCache bool) string {
 	return cacheKey
 }
 
-func testBasicBaseConfig(grpcPort, perSecond string, local_cache_size string) func(*testing.T) {
+func testBasicBaseConfig(s settings.Settings) func(*testing.T) {
 	return func(t *testing.T) {
-		os.Setenv("REDIS_PERSECOND", perSecond)
-		os.Setenv("PORT", "8082")
-		os.Setenv("GRPC_PORT", grpcPort)
-		os.Setenv("DEBUG_PORT", "8084")
-		os.Setenv("RUNTIME_ROOT", "runtime/current")
-		os.Setenv("RUNTIME_SUBDIRECTORY", "ratelimit")
-		os.Setenv("REDIS_PERSECOND_SOCKET_TYPE", "tcp")
-		os.Setenv("REDIS_SOCKET_TYPE", "tcp")
-		os.Setenv("LOCAL_CACHE_SIZE_IN_BYTES", local_cache_size)
-		os.Setenv("USE_STATSD", "false")
-
-		local_cache_size_val, _ := strconv.Atoi(local_cache_size)
-		enable_local_cache := local_cache_size_val > 0
-		runner := runner.NewRunner()
-
-		go func() {
-			runner.Run()
-		}()
-
-		// HACK: Wait for the server to come up. Make a hook that we can wait on.
-		time.Sleep(1 * time.Second)
+		enable_local_cache := s.LocalCacheSizeInBytes > 0
+		runner := startTestRunner(t, s)
+		defer runner.Stop()
 
 		assert := assert.New(t)
-		conn, err := grpc.Dial(fmt.Sprintf("localhost:%s", grpcPort), grpc.WithInsecure())
+		conn, err := grpc.Dial(fmt.Sprintf("localhost:%v", s.GrpcPort), grpc.WithInsecure())
 		assert.NoError(err)
 		defer conn.Close()
 		c := pb.NewRateLimitServiceClient(conn)
@@ -137,7 +366,8 @@ func testBasicBaseConfig(grpcPort, perSecond string, local_cache_size string) fu
 		response, err := c.ShouldRateLimit(
 			context.Background(),
 			common.NewRateLimitRequest("foo", [][][2]string{{{getCacheKey("hello", enable_local_cache), "world"}}}, 1))
-		assert.Equal(
+		common.AssertProtoEqual(
+			assert,
 			&pb.RateLimitResponse{
 				OverallCode: pb.RateLimitResponse_OK,
 				Statuses:    []*pb.RateLimitResponse_DescriptorStatus{{Code: pb.RateLimitResponse_OK, CurrentLimit: nil, LimitRemaining: 0}}},
@@ -155,11 +385,14 @@ func testBasicBaseConfig(grpcPort, perSecond string, local_cache_size string) fu
 		response, err = c.ShouldRateLimit(
 			context.Background(),
 			common.NewRateLimitRequest("basic", [][][2]string{{{getCacheKey("key1", enable_local_cache), "foo"}}}, 1))
-		assert.Equal(
+		durRemaining := response.GetStatuses()[0].DurationUntilReset
+
+		common.AssertProtoEqual(
+			assert,
 			&pb.RateLimitResponse{
 				OverallCode: pb.RateLimitResponse_OK,
 				Statuses: []*pb.RateLimitResponse_DescriptorStatus{
-					newDescriptorStatus(pb.RateLimitResponse_OK, 50, pb.RateLimitResponse_RateLimit_SECOND, 49)}},
+					newDescriptorStatus(pb.RateLimitResponse_OK, 50, pb.RateLimitResponse_RateLimit_SECOND, 49, durRemaining)}},
 			response)
 		assert.NoError(err)
 
@@ -194,12 +427,14 @@ func testBasicBaseConfig(grpcPort, perSecond string, local_cache_size string) fu
 				status = pb.RateLimitResponse_OVER_LIMIT
 				limitRemaining = 0
 			}
+			durRemaining = response.GetStatuses()[0].DurationUntilReset
 
-			assert.Equal(
+			common.AssertProtoEqual(
+				assert,
 				&pb.RateLimitResponse{
 					OverallCode: status,
 					Statuses: []*pb.RateLimitResponse_DescriptorStatus{
-						newDescriptorStatus(status, 20, pb.RateLimitResponse_RateLimit_MINUTE, limitRemaining)}},
+						newDescriptorStatus(status, 20, pb.RateLimitResponse_RateLimit_MINUTE, limitRemaining, durRemaining)}},
 				response)
 			assert.NoError(err)
 			key2HitCounter := runner.GetStatsStore().NewCounter(fmt.Sprintf("ratelimit.service.rate_limit.another.%s.total_hits", getCacheKey("key2", enable_local_cache)))
@@ -210,7 +445,6 @@ func testBasicBaseConfig(grpcPort, perSecond string, local_cache_size string) fu
 			} else {
 				assert.Equal(0, int(key2OverlimitCounter.Value()))
 			}
-
 			key2LocalCacheOverLimitCounter := runner.GetStatsStore().NewCounter(fmt.Sprintf("ratelimit.service.rate_limit.another.%s.over_limit_with_local_cache", getCacheKey("key2", enable_local_cache)))
 			if enable_local_cache && i >= 20 {
 				assert.Equal(i-20, int(key2LocalCacheOverLimitCounter.Value()))
@@ -257,15 +491,18 @@ func testBasicBaseConfig(grpcPort, perSecond string, local_cache_size string) fu
 				status = pb.RateLimitResponse_OVER_LIMIT
 				limitRemaining2 = 0
 			}
-
-			assert.Equal(
+			durRemaining1 := response.GetStatuses()[0].DurationUntilReset
+			durRemaining2 := response.GetStatuses()[1].DurationUntilReset
+			common.AssertProtoEqual(
+				assert,
 				&pb.RateLimitResponse{
 					OverallCode: status,
 					Statuses: []*pb.RateLimitResponse_DescriptorStatus{
-						newDescriptorStatus(pb.RateLimitResponse_OK, 20, pb.RateLimitResponse_RateLimit_MINUTE, limitRemaining1),
-						newDescriptorStatus(status, 10, pb.RateLimitResponse_RateLimit_HOUR, limitRemaining2)}},
+						newDescriptorStatus(pb.RateLimitResponse_OK, 20, pb.RateLimitResponse_RateLimit_MINUTE, limitRemaining1, durRemaining1),
+						newDescriptorStatus(status, 10, pb.RateLimitResponse_RateLimit_HOUR, limitRemaining2, durRemaining2)}},
 				response)
 			assert.NoError(err)
+
 			key2HitCounter := runner.GetStatsStore().NewCounter(fmt.Sprintf("ratelimit.service.rate_limit.another.%s.total_hits", getCacheKey("key2", enable_local_cache)))
 			assert.Equal(i+26, int(key2HitCounter.Value()))
 			key2OverlimitCounter := runner.GetStatsStore().NewCounter(fmt.Sprintf("ratelimit.service.rate_limit.another.%s.over_limit", getCacheKey("key2", enable_local_cache)))
@@ -318,32 +555,36 @@ func testBasicBaseConfig(grpcPort, perSecond string, local_cache_size string) fu
 			} else {
 				assert.Equal(0, int(localCacheMissCounter.Value()))
 			}
-
 		}
+
+		// Test DurationUntilReset by hitting same key twice
+		resp1, err := c.ShouldRateLimit(
+			context.Background(),
+			common.NewRateLimitRequest("another", [][][2]string{{{getCacheKey("key4", enable_local_cache), "durTest"}}}, 1))
+
+		time.Sleep(2 * time.Second) // Wait to allow duration to tick down
+
+		resp2, err := c.ShouldRateLimit(
+			context.Background(),
+			common.NewRateLimitRequest("another", [][][2]string{{{getCacheKey("key4", enable_local_cache), "durTest"}}}, 1))
+
+		assert.Less(resp2.GetStatuses()[0].DurationUntilReset.GetSeconds(), resp1.GetStatuses()[0].DurationUntilReset.GetSeconds())
 	}
 }
 
 func TestBasicConfigLegacy(t *testing.T) {
-	os.Setenv("PORT", "8082")
-	os.Setenv("GRPC_PORT", "8083")
-	os.Setenv("DEBUG_PORT", "8084")
-	os.Setenv("RUNTIME_ROOT", "runtime/current")
-	os.Setenv("RUNTIME_SUBDIRECTORY", "ratelimit")
+	common.WithMultiRedis(t, []common.RedisConfig{
+		{Port: 6383},
+	}, func() {
+		testBasicConfigLegacy(t)
+	})
+}
 
-	os.Setenv("REDIS_PERSECOND_URL", "localhost:6380")
-	os.Setenv("REDIS_URL", "localhost:6379")
-	os.Setenv("REDIS_TLS", "false")
-	os.Setenv("REDIS_AUTH", "")
-	os.Setenv("REDIS_PERSECOND_TLS", "false")
-	os.Setenv("REDIS_PERSECOND_AUTH", "")
+func testBasicConfigLegacy(t *testing.T) {
+	s := makeSimpleRedisSettings(6383, 6380, false, 0)
 
-	runner := runner.NewRunner()
-	go func() {
-		runner.Run()
-	}()
-
-	// HACK: Wait for the server to come up. Make a hook that we can wait on.
-	time.Sleep(100 * time.Millisecond)
+	runner := startTestRunner(t, s)
+	defer runner.Stop()
 
 	assert := assert.New(t)
 	conn, err := grpc.Dial("localhost:8083", grpc.WithInsecure())
@@ -355,45 +596,23 @@ func TestBasicConfigLegacy(t *testing.T) {
 	response, err := c.ShouldRateLimit(
 		context.Background(),
 		common.NewRateLimitRequestLegacy("foo", [][][2]string{{{"hello", "world"}}}, 1))
-	assert.Equal(
+	common.AssertProtoEqual(
+		assert,
 		&pb_legacy.RateLimitResponse{
 			OverallCode: pb_legacy.RateLimitResponse_OK,
 			Statuses:    []*pb_legacy.RateLimitResponse_DescriptorStatus{{Code: pb_legacy.RateLimitResponse_OK, CurrentLimit: nil, LimitRemaining: 0}}},
 		response)
 	assert.NoError(err)
 
-	json_body := []byte(`{
-		"domain": "basic",
-		"descriptors": [
-			{
-				"entries": [
-					{
-						"key": "one_per_minute"
-					}
-				]
-			}
-		]
-	}`)
-	http_resp, _ := http.Post("http://localhost:8082/json", "application/json", bytes.NewBuffer(json_body))
-	assert.Equal(http_resp.StatusCode, 200)
-	http_resp.Body.Close()
-
-	http_resp, _ = http.Post("http://localhost:8082/json", "application/json", bytes.NewBuffer(json_body))
-	assert.Equal(http_resp.StatusCode, 429)
-	http_resp.Body.Close()
-
-	invalid_json := []byte(`{"unclosed quote: []}`)
-	http_resp, _ = http.Post("http://localhost:8082/json", "application/json", bytes.NewBuffer(invalid_json))
-	assert.Equal(http_resp.StatusCode, 400)
-
 	response, err = c.ShouldRateLimit(
 		context.Background(),
 		common.NewRateLimitRequestLegacy("basic_legacy", [][][2]string{{{"key1", "foo"}}}, 1))
-	assert.Equal(
+	common.AssertProtoEqual(
+		assert,
 		&pb_legacy.RateLimitResponse{
 			OverallCode: pb_legacy.RateLimitResponse_OK,
 			Statuses: []*pb_legacy.RateLimitResponse_DescriptorStatus{
-				newDescriptorStatusLegacy(pb_legacy.RateLimitResponse_OK, 50, pb_legacy.RateLimit_SECOND, 49)}},
+				newDescriptorStatusLegacy(pb_legacy.RateLimitResponse_OK, 50, pb_legacy.RateLimitResponse_RateLimit_SECOND, 49)}},
 		response)
 	assert.NoError(err)
 
@@ -413,11 +632,12 @@ func TestBasicConfigLegacy(t *testing.T) {
 			limitRemaining = 0
 		}
 
-		assert.Equal(
+		common.AssertProtoEqual(
+			assert,
 			&pb_legacy.RateLimitResponse{
 				OverallCode: status,
 				Statuses: []*pb_legacy.RateLimitResponse_DescriptorStatus{
-					newDescriptorStatusLegacy(status, 20, pb_legacy.RateLimit_MINUTE, limitRemaining)}},
+					newDescriptorStatusLegacy(status, 20, pb_legacy.RateLimitResponse_RateLimit_MINUTE, limitRemaining)}},
 			response)
 		assert.NoError(err)
 	}
@@ -441,13 +661,124 @@ func TestBasicConfigLegacy(t *testing.T) {
 			limitRemaining2 = 0
 		}
 
-		assert.Equal(
+		common.AssertProtoEqual(
+			assert,
 			&pb_legacy.RateLimitResponse{
 				OverallCode: status,
 				Statuses: []*pb_legacy.RateLimitResponse_DescriptorStatus{
-					newDescriptorStatusLegacy(pb_legacy.RateLimitResponse_OK, 20, pb_legacy.RateLimit_MINUTE, limitRemaining1),
-					newDescriptorStatusLegacy(status, 10, pb_legacy.RateLimit_HOUR, limitRemaining2)}},
+					newDescriptorStatusLegacy(pb_legacy.RateLimitResponse_OK, 20, pb_legacy.RateLimitResponse_RateLimit_MINUTE, limitRemaining1),
+					newDescriptorStatusLegacy(status, 10, pb_legacy.RateLimitResponse_RateLimit_HOUR, limitRemaining2)}},
 			response)
 		assert.NoError(err)
+	}
+}
+
+func startTestRunner(t *testing.T, s settings.Settings) *runner.Runner {
+	t.Helper()
+	runner := runner.NewRunner(s)
+
+	go func() {
+		// Catch a panic() to ensure that test name is printed.
+		// Otherwise go doesn't know what test this goroutine is
+		// associated with.
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("Uncaught panic(): %v", r)
+			}
+		}()
+		runner.Run()
+	}()
+
+	// HACK: Wait for the server to come up. Make a hook that we can wait on.
+	common.WaitForTcpPort(context.Background(), s.GrpcPort, 1*time.Second)
+
+	return &runner
+}
+
+func testConfigReload(s settings.Settings) func(*testing.T) {
+	return func(t *testing.T) {
+		enable_local_cache := s.LocalCacheSizeInBytes > 0
+		runner := startTestRunner(t, s)
+		defer runner.Stop()
+
+		assert := assert.New(t)
+		conn, err := grpc.Dial(fmt.Sprintf("localhost:%v", s.GrpcPort), grpc.WithInsecure())
+		assert.NoError(err)
+		defer conn.Close()
+		c := pb.NewRateLimitServiceClient(conn)
+
+		response, err := c.ShouldRateLimit(
+			context.Background(),
+			common.NewRateLimitRequest("reload", [][][2]string{{{getCacheKey("block", enable_local_cache), "foo"}}}, 1))
+		common.AssertProtoEqual(
+			assert,
+			&pb.RateLimitResponse{
+				OverallCode: pb.RateLimitResponse_OK,
+				Statuses:    []*pb.RateLimitResponse_DescriptorStatus{{Code: pb.RateLimitResponse_OK}}},
+			response)
+		assert.NoError(err)
+
+		runner.GetStatsStore().Flush()
+		loadCount1 := runner.GetStatsStore().NewCounter("ratelimit.service.config_load_success").Value()
+
+		// Copy a new file to config folder to test config reload functionality
+		in, err := os.Open("runtime/current/ratelimit/reload.yaml")
+		if err != nil {
+			panic(err)
+		}
+		defer in.Close()
+		out, err := os.Create("runtime/current/ratelimit/config/reload.yaml")
+		if err != nil {
+			panic(err)
+		}
+		defer out.Close()
+		_, err = io.Copy(out, in)
+		if err != nil {
+			panic(err)
+		}
+		err = out.Close()
+		if err != nil {
+			panic(err)
+		}
+
+		// Need to wait for config reload to take place and new descriptors to be loaded.
+		// Shouldn't take more than 5 seconds but wait 120 at most just to be safe.
+		wait := 120
+		reloaded := false
+		loadCount2 := uint64(0)
+
+		for i := 0; i < wait; i++ {
+			time.Sleep(1 * time.Second)
+			runner.GetStatsStore().Flush()
+			loadCount2 = runner.GetStatsStore().NewCounter("ratelimit.service.config_load_success").Value()
+
+			// Check that successful loads count has increased before continuing.
+			if loadCount2 > loadCount1 {
+				reloaded = true
+				break
+			}
+		}
+
+		assert.True(reloaded)
+		assert.Greater(loadCount2, loadCount1)
+
+		response, err = c.ShouldRateLimit(
+			context.Background(),
+			common.NewRateLimitRequest("reload", [][][2]string{{{getCacheKey("key1", enable_local_cache), "foo"}}}, 1))
+
+		durRemaining := response.GetStatuses()[0].DurationUntilReset
+		common.AssertProtoEqual(
+			assert,
+			&pb.RateLimitResponse{
+				OverallCode: pb.RateLimitResponse_OK,
+				Statuses: []*pb.RateLimitResponse_DescriptorStatus{
+					newDescriptorStatus(pb.RateLimitResponse_OK, 50, pb.RateLimitResponse_RateLimit_SECOND, 49, durRemaining)}},
+			response)
+		assert.NoError(err)
+
+		err = os.Remove("runtime/current/ratelimit/config/reload.yaml")
+		if err != nil {
+			panic(err)
+		}
 	}
 }
